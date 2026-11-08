@@ -13,6 +13,12 @@ type Config struct {
 	Searcher Searcher
 	Queue    ExecutionQueue
 
+	// Upcasters holds the explicit payload revision transformation graph.
+	// When nil, the package-level default registry populated through
+	// [RegisterEventUpcaster] is used. Each Filter call pins one immutable
+	// registry generation for its whole event batch.
+	Upcasters *EventUpcasterRegistry
+
 	// Autovacuum tunes PostgreSQL's autovacuum and autoanalyze behavior of the
 	// events2 table.
 	Autovacuum AutovacuumConfig

@@ -35,6 +35,8 @@ type Eventstore struct {
 	querier  Querier
 	searcher Searcher
 
+	upcasters *EventUpcasterRegistry
+
 	logger *slog.Logger
 }
 
@@ -69,6 +71,10 @@ type eventTypeInterceptors struct {
 }
 
 func NewEventstore(config *Config) *Eventstore {
+	upcasters := config.Upcasters
+	if upcasters == nil {
+		upcasters = defaultUpcasterRegistry
+	}
 	return &Eventstore{
 		PushTimeout: config.PushTimeout,
 		maxRetries:  int(config.MaxRetries),
@@ -76,7 +82,9 @@ func NewEventstore(config *Config) *Eventstore {
 		pusher:   config.Pusher,
 		querier:  config.Querier,
 		searcher: config.Searcher,
-		logger:   logging.New(logging.StreamEventPusher),
+
+		upcasters: upcasters,
+		logger:    logging.New(logging.StreamEventPusher),
 	}
 }
 
@@ -199,8 +207,12 @@ const maxFilterCapacity = 1000
 func (es *Eventstore) Filter(ctx context.Context, searchQuery *SearchQueryBuilder) ([]Event, error) {
 	events := make([]Event, 0, min(searchQuery.GetLimit(), maxFilterCapacity))
 	searchQuery.ensureInstanceID(ctx)
+	// Pin one immutable registry generation for the whole batch so a
+	// concurrent hot registration can never make events of the same Filter
+	// traverse different transformation paths.
+	generation := es.upcasters.Snapshot()
 	err := es.querier.FilterToReducer(ctx, searchQuery, func(event Event) error {
-		event, err := es.mapEvent(event)
+		event, err := es.mapEventInGeneration(generation, event)
 		if err != nil {
 			return err
 		}
@@ -214,9 +226,10 @@ func (es *Eventstore) Filter(ctx context.Context, searchQuery *SearchQueryBuilde
 }
 
 func (es *Eventstore) mapEvents(events []Event) (mappedEvents []Event, err error) {
+	generation := es.upcasters.Snapshot()
 	mappedEvents = make([]Event, len(events))
 	for i, event := range events {
-		mappedEvents[i], err = es.mapEventLocked(event)
+		mappedEvents[i], err = es.mapEventInGeneration(generation, event)
 		if err != nil {
 			return nil, err
 		}
@@ -225,15 +238,23 @@ func (es *Eventstore) mapEvents(events []Event) (mappedEvents []Event, err error
 }
 
 func (es *Eventstore) mapEvent(event Event) (Event, error) {
-	return es.mapEventLocked(event)
+	return es.mapEventInGeneration(es.upcasters.Snapshot(), event)
 }
 
-func (es *Eventstore) mapEventLocked(event Event) (Event, error) {
-	interceptors, ok := eventInterceptors[event.Type()]
-	if !ok || interceptors.eventMapper == nil {
-		return BaseEventFromRepo(event), nil
+// mapEventInGeneration first upcasts the event payload along the fixed,
+// acyclic path resolved in the pinned generation and then applies the
+// registered event mapper. Events without an upcast configuration keep
+// using the original mapping path unchanged.
+func (es *Eventstore) mapEventInGeneration(generation UpcastGeneration, event Event) (Event, error) {
+	upcast, err := generation.Upcast(event)
+	if err != nil {
+		return nil, err
 	}
-	return interceptors.eventMapper(event)
+	interceptors, ok := eventInterceptors[upcast.Type()]
+	if !ok || interceptors.eventMapper == nil {
+		return BaseEventFromRepo(upcast), nil
+	}
+	return interceptors.eventMapper(upcast)
 }
 
 // TODO: refactor so we can change to the following interface:
@@ -255,8 +276,10 @@ type reducer interface {
 // FilterToReducer filters the events based on the search query, appends all events to the reducer and calls it's reduce function
 func (es *Eventstore) FilterToReducer(ctx context.Context, searchQuery *SearchQueryBuilder, r reducer) error {
 	searchQuery.ensureInstanceID(ctx)
+	// The whole reducer run shares one immutable registry generation.
+	generation := es.upcasters.Snapshot()
 	return es.querier.FilterToReducer(ctx, searchQuery, func(event Event) error {
-		event, err := es.mapEvent(event)
+		event, err := es.mapEventInGeneration(generation, event)
 		if err != nil {
 			return err
 		}
